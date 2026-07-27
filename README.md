@@ -9,12 +9,20 @@ on the Steam forums back in 2017. This is a workaround.
 
 ---
 
-## Quick start
-
-1. **Back up your character file.**
-
+1. **Back up your character file (this is all of your characters 9 Slots).**
    ```
-   copy "C:\Program Files (x86)\Steam\userdata\<your-id>\374040\remote\0100000000000000" "%USERPROFILE%\Downloads\pk_bk_01"
+Steam cloud is on (change your ID to your ID it will be like 915394459, 9 digits if you cant find it just go to before your userdata)
+copy "C:\Program Files (x86)\Steam\userdata\<your-id>\374040\remote\0100000000000000" "%USERPROFILE%\Downloads\pk_bk_01"
+OR 
+Steam cloud is off (Change your user to your computer name) 
+"C:\Users"your_user"\Saved Games\portal_knights\0100000000000000" "%USERPROFILE%\Downloads\pk_bk_01"
+   ```
+
+Split-screen / Guest profiles
+
+Player 2's characters live in a Guest subfolder:
+   ```
+%USERPROFILE%\Saved Games\portal_knights\Guest\0100000000000000
    ```
 
    `0100000000000000` holds **all** your characters — that is the one that
@@ -159,7 +167,7 @@ An empty-name record looks like `name 00 00 templateCRC` and is skipped.
 
 ```
 --list                 list characters found in memory
---also NAME            with --list, also search raw buffers for this exact
+--find NAME            with --list, also search raw buffers for this exact
                        name (needed when it has no compact record)
 --rename OLD --to NEW  rename a character (this is all you need)
 --dry-run              show what would be written, change nothing
