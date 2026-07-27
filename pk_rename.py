@@ -40,7 +40,7 @@ import re
 import struct
 import sys
 
-VERSION = "1.6"
+VERSION = "1.7"
 PROCESS_NAME = "portal_knights_x64.exe"
 
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -258,57 +258,51 @@ def extract_name(chunk, name_pos):
     """
     Given a buffer and the offset of "name", return (rel_offset, text).
 
-    GROUND TRUTH - four real records, all read from live memory or the
-    save file. Note the header is NOT a fixed width:
+    GROUND TRUTH - every confirmed sample, from memory and the save file:
 
-      1-char name, save : 6E 61 6D 65 | 00 80 | 01 0C 00       | 41
-      1-char name, mem  : 6E 61 6D 65 | 00 80 | 01 64 00       | 41
-      4-char  "YEAH"    : 6E 61 6D 65 | 00 80 | 00 00 00 00    | 59 45 41 48
-      32-char digits    : 6E 61 6D 65 | 00 80 | 00 00 00 00    | 31 32 33 ...
-                                        ^^^^^^^^^^^^^^^^^^
-                                        3 or 4 bytes, varies
+        00 80 | 01 0C 00    | 41                 "A"      text at +9
+        00 80 | 01 64 00    | 41                 "A"      text at +9
+        00 80 | 01 64 0C    | 52 45 41 4C        "REAL"   text at +9
+        00 80 | 00 00 00 00 | 59 45 41 48        "YEAH"   text at +10
+        00 80 | 00 00 00 00 | 31 32 33 ...       digits   text at +10
 
-    Hardcoding a 5-byte header (text at +9) worked for the 1-character
-    case and silently rejected every 4-byte-header record, because +9
-    landed on the final 0x00 of the header.
+    There are exactly TWO layouts, and the byte at +6 says which:
 
-    Two further traps, both of which defeated earlier versions:
-      * a header byte can itself be printable - 0x64 is 'd', 0x65 is 'e' -
-        so "first printable run wins" returns a header byte as the name;
-      * scanning too far forward finds unrelated printable bytes after
-        the name and returns those instead.
+        +6 == 0x01  ->  3-byte header, text starts at +9
+        +6 == 0x00  ->  4-byte header, text starts at +10
 
-    The rule that satisfies all four samples: consider runs starting
-    between +6 and +12, and take the LONGEST, preferring one immediately
-    preceded by a null. Header bytes are isolated singles, so a genuine
-    name always wins on length.
+    Earlier versions searched a window of +6..+12 and took the longest
+    printable run. That was guesswork, and it produced junk like
+    "e 123456789Z": 0x65 is 'e' and 0x20 is a space, so header bytes got
+    swallowed into the name. Reading the exact offset removes the
+    ambiguity entirely.
     """
-    base = name_pos + 4
-    if chunk[base:base + 2] != NAME_HDR:
-        return None            # empty-name records read 00 00 here
+    hdr = chunk[name_pos + 4:name_pos + 6]
+    if hdr != NAME_HDR:
+        return None                      # empty-name records read 00 00
 
-    best = None
-    for start in range(6, 13):
-        pos = name_pos + start
-        if pos >= len(chunk):
+    marker = chunk[name_pos + 6:name_pos + 7]
+    if marker == b"\x01":
+        start = name_pos + 9
+    elif marker == b"\x00":
+        start = name_pos + 10
+    else:
+        return None                      # unknown layout: report nothing
+
+    text = bytearray()
+    for k in range(start, min(start + MAX_NAME, len(chunk))):
+        b = chunk[k]
+        if 0x20 <= b <= 0x7E:
+            text.append(b)
+        else:
             break
-        if not (0x20 <= chunk[pos] <= 0x7E):
-            continue
-        n = 0
-        while (pos + n < len(chunk) and 0x20 <= chunk[pos + n] <= 0x7E
-               and n < MAX_NAME):
-            n += 1
-        text = chunk[pos:pos + n].decode("ascii", "ignore")
-        if text.lower() in FIELD_KEYS:
-            continue
-        prev_null = chunk[pos - 1] == 0 if pos > 0 else False
-        cand = (n, prev_null, pos, text)
-        if best is None or (cand[0], cand[1]) > (best[0], best[1]):
-            best = cand
 
-    if best is None:
+    if not text:
         return None
-    return best[2], best[3]
+    name = text.decode("ascii", "ignore")
+    if name.lower() in FIELD_KEYS:
+        return None
+    return start, name
 
 
 def scan(mem, verbose=False):
@@ -1385,13 +1379,17 @@ def cmd_list(mem, args):
 
     only_compact = set(by_name) - set(live)
     only_raw = set(live) - set(by_name)
-    if only_compact and only_raw:
-        print("\n[!] The two structures disagree.")
-        print("    Compact only: %s" % ", ".join(sorted(only_compact)))
-        print("    Raw only    : %s" % ", ".join(sorted(only_raw)))
-        print("    The game shows the RAW value. This happens after a --grow")
-        print("    rename, where the compact records had no room and were")
-        print("    skipped. Harmless - the game re-writes them when it saves.")
+    if only_compact or only_raw:
+        print("\nNOTE: the two structures do not match.")
+        if only_compact:
+            print("    Compact only: %s" % ", ".join(sorted(only_compact)))
+        if only_raw:
+            print("    Raw only    : %s" % ", ".join(sorted(only_raw)))
+        print("    This is normal. Compact records are written only while a")
+        print("    character is being serialised, so they come and go; raw")
+        print("    buffers linger from characters loaded earlier in the")
+        print("    session. The game displays the RAW value, and that is what")
+        print("    a rename writes.")
 
     if not recs and not live:
         print("\nNo characters found yet - nothing is wrong.")
