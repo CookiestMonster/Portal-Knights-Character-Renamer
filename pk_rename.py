@@ -40,7 +40,7 @@ import re
 import struct
 import sys
 
-VERSION = "1.5"
+VERSION = "1.6"
 PROCESS_NAME = "portal_knights_x64.exe"
 
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -1230,21 +1230,49 @@ def names_from_savefile(verbose=False):
     import glob
     import os
 
-    pats = [
-        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-                     "Steam", "userdata", "*", "374040", "remote",
-                     "0100000000000000"),
-        os.path.join(os.environ.get("USERPROFILE", ""), "Saved Games",
-                     "portal_knights", "0100000000000000"),
+    # Two possible save roots, and which one is live depends on whether
+    # Steam Cloud is enabled:
+    #
+    #   cloud ON  -> Steam\\userdata\\<id>\\374040\\remote\\
+    #   cloud OFF -> %USERPROFILE%\\Saved Games\\portal_knights\\
+    #
+    # Both can exist at once, and the disabled one is then stale. Taking
+    # the first match found would happily read a months-old cloud file and
+    # report names that are no longer correct, so pick the NEWEST instead.
+    #
+    # The Guest subfolder holds the split-screen player 2 profile and is
+    # deliberately included - it is a real save, just a different one.
+    roots = [
+        os.path.join(os.environ.get("ProgramFiles(x86)",
+                                    r"C:\Program Files (x86)"),
+                     "Steam", "userdata", "*", "374040", "remote"),
+        os.path.join(os.environ.get("USERPROFILE", ""),
+                     "Saved Games", "portal_knights"),
+        os.path.join(os.environ.get("USERPROFILE", ""),
+                     "Saved Games", "portal_knights", "Guest"),
     ]
-    path = None
-    for pat in pats:
-        hits = glob.glob(pat)
-        if hits:
-            path = hits[0]
-            break
-    if not path:
+
+    candidates = []
+    for root in roots:
+        for hit in glob.glob(os.path.join(root, "0100000000000000")):
+            try:
+                candidates.append((os.path.getmtime(hit), hit))
+            except OSError:
+                pass
+    if not candidates:
         return None, None
+    candidates.sort(reverse=True)
+    path = candidates[0][1]
+
+    if verbose and len(candidates) > 1:
+        print("[*] %d save files found; using the most recently modified."
+              % len(candidates))
+        for mtime, other in candidates:
+            import datetime
+            when = datetime.datetime.fromtimestamp(mtime)
+            mark = "  <-- using" if other == path else ""
+            print("      %s  %s%s"
+                  % (when.strftime("%Y-%m-%d %H:%M"), other, mark))
 
     try:
         with open(path, "rb") as fh:
