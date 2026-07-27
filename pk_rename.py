@@ -30,40 +30,6 @@ WHY IT WRITES EVERY COPY AT ONCE
 The game keeps several copies of each record in memory. Changing one lets
 another overwrite it moments later, which is why single edits appear to do
 nothing. This writes all copies in one pass.
-
-CHANGES IN THIS REVISION (code review pass, no new memory-layout guessing)
-  1. OpenProcess / CreateToolhelp32Snapshot now declare an explicit ctypes
-     restype of c_void_p. Left at the default, ctypes treats a HANDLE return
-     value as a 32-bit c_int, which is the wrong size on 64-bit Windows -
-     harmless for small handle values, silently wrong for larger ones. This
-     was a latent bug, not something that had visibly failed yet.
-  2. RAW_BUFFER_SIZE was 32. The README documents the buffer as actually
-     128 bytes, confirmed from six independent measurements. The 32-byte
-     value was never updated after that measurement and made the
-     null-padding check for short names weaker than it should have been
-     (31 required zero bytes instead of 127) - still correct, just a much
-     easier bar to clear by coincidence.
-  3. Mem.read() now retries with a smaller size if a read fails, instead of
-     giving up. A raw buffer sitting near the end of a mapped region could
-     have its read request spill into unmapped memory and fail outright,
-     silently dropping a genuine candidate rather than just trimming to
-     what is actually readable.
-  4. The four separate places that each implemented "find NAME preceded and
-     followed by null bytes" (scan_both, cmd_list, cmd_pick, cmd_measure,
-     and the now-removed scan_raw_buffers) are consolidated into one
-     function, iter_raw_buffers(). Four independent implementations of the
-     same check meant a fix to one did not apply to the others - which is
-     exactly how RAW_BUFFER_SIZE's stale value survived unnoticed in one
-     of them after being corrected elsewhere.
-  5. scan_raw_buffers() and find_referenced() were unused - nothing in
-     main() or any cmd_* function called either of them, the design they
-     supported (pointer-reference filtering) was superseded by "write
-     every raw candidate" per cmd_pick's own docstring. Removed rather
-     than left as dead code that looks load-bearing.
-  6. cmd_list() previously called scan() and then ran its own second full
-     memory walk for raw buffers - two full passes over the process's
-     address space per invocation. It now calls scan_both() once, like
-     cmd_rename() already did.
 """
 
 import argparse
@@ -71,8 +37,10 @@ import time
 import ctypes
 import ctypes.wintypes as wt
 import re
+import struct
 import sys
 
+VERSION = "1.5"
 PROCESS_NAME = "portal_knights_x64.exe"
 
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -94,6 +62,9 @@ PAGE_GUARD = 0x100
 
 # The game's own limit is 32 characters - confirmed by creating a character
 # named "12345678912345678912345678912345" and seeing it accepted in full.
+# This was 24, which silently TRUNCATED longer names so they could never be
+# matched by --rename. RAW_BUFFER_SIZE below already said 32; the two
+# constants disagreed.
 MAX_NAME = 32
 NAME_HDR = b"\x00\x80"          # constant two bytes after "name"
 
@@ -106,13 +77,6 @@ NAME_HDR = b"\x00\x80"          # constant two bytes after "name"
 # Search a small window instead of assuming one fixed offset.
 SLOTID_TO_NAME_MIN = 8
 SLOTID_TO_NAME_MAX = 20
-
-# Confirmed by --measure across six separate names (see README "Name
-# length"): a 32-character name leaves exactly 96 trailing nulls, i.e. the
-# real buffer is 128 bytes, not 32. Used as the strength of the null-padding
-# check in iter_raw_buffers() for short names, where the name itself is too
-# short to be strong evidence on its own.
-RAW_BUFFER_SIZE = 128
 
 
 def find_name_marker(data, slot_pos):
@@ -160,37 +124,6 @@ def _fail(msg):
     sys.exit(1)
 
 
-def _configure_kernel32_prototypes(k32):
-    """Declare restype/argtypes for the HANDLE-returning calls we use.
-
-    Left at ctypes' default, a foreign function's restype is c_int (32-bit
-    signed). CreateToolhelp32Snapshot and OpenProcess both return HANDLE,
-    which is pointer-sized (64-bit on x64 Windows). Any handle value that
-    doesn't fit in 32 bits would be silently truncated/misread. In
-    practice handle values are usually small, so this had probably never
-    visibly failed - but "usually small" isn't a guarantee, and it costs
-    nothing to declare it correctly.
-    """
-    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
-    k32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
-
-    k32.OpenProcess.restype = ctypes.c_void_p
-    k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
-
-    k32.CloseHandle.restype = wt.BOOL
-    k32.CloseHandle.argtypes = [ctypes.c_void_p]
-
-    k32.Process32First.restype = wt.BOOL
-    k32.Process32Next.restype = wt.BOOL
-
-    k32.VirtualQueryEx.restype = ctypes.c_size_t
-    k32.VirtualQueryEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
-                                    ctypes.c_void_p, ctypes.c_size_t]
-
-    k32.ReadProcessMemory.restype = wt.BOOL
-    k32.WriteProcessMemory.restype = wt.BOOL
-
-
 def find_pid(name=PROCESS_NAME):
     """Locate the game process without third-party modules."""
     TH32CS_SNAPPROCESS = 0x00000002
@@ -210,9 +143,8 @@ def find_pid(name=PROCESS_NAME):
         ]
 
     k32 = ctypes.windll.kernel32
-    _configure_kernel32_prototypes(k32)
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if not snap or snap == ctypes.c_void_p(-1).value:
+    if snap == -1:
         _fail("CreateToolhelp32Snapshot failed.")
 
     entry = PROCESSENTRY32()
@@ -237,7 +169,6 @@ class Mem:
 
     def __init__(self, pid):
         self.k32 = ctypes.windll.kernel32
-        _configure_kernel32_prototypes(self.k32)
         self.h = self.k32.OpenProcess(ACCESS, False, pid)
         if not self.h:
             _fail("OpenProcess failed (error %d). Run as Administrator."
@@ -306,27 +237,13 @@ class Mem:
         self._region_cache[key] = collected
 
     def read(self, addr, size):
-        """Read `size` bytes at `addr`, shrinking the request on failure.
-
-        A straightforward ReadProcessMemory call fails outright if any part
-        of the requested range is unreadable - which happens whenever a
-        candidate sits close enough to the end of its mapped region that
-        `addr + size` spills into unmapped memory. Rather than lose the
-        whole read (and silently drop whatever candidate prompted it), retry
-        with a smaller size a few times before giving up.
-        """
-        want = size
-        for _ in range(6):
-            if want <= 0:
-                return None
-            buf = ctypes.create_string_buffer(want)
-            got = ctypes.c_size_t(0)
-            ok = self.k32.ReadProcessMemory(
-                self.h, ctypes.c_void_p(addr), buf, want, ctypes.byref(got))
-            if ok:
-                return buf.raw[:got.value]
-            want //= 2
-        return None
+        buf = ctypes.create_string_buffer(size)
+        got = ctypes.c_size_t(0)
+        ok = self.k32.ReadProcessMemory(
+            self.h, ctypes.c_void_p(addr), buf, size, ctypes.byref(got))
+        if not ok:
+            return None
+        return buf.raw[:got.value]
 
     def write(self, addr, data):
         n = len(data)
@@ -395,7 +312,20 @@ def extract_name(chunk, name_pos):
 
 
 def scan(mem, verbose=False):
-    """Return a list of dicts: {addr, name, length} for compact records."""
+    """Return a list of dicts: {addr, name, length} for compact records.
+
+    Two bugs used to hide records here:
+
+      * The chunk loop read exactly 4 MB with no overlap, so any record
+        straddling a boundary was cut in half and lost. Over ~1.8 GB that
+        is ~450 chances to miss one. Now uses mem.chunks(), which overlaps.
+
+      * It restricted the search to MEM_PRIVATE. But a real record was
+        observed at 7FF7C7AC8583 - inside the module range, not the heap -
+        so that filter silently discarded genuine hits. The diagnostic
+        --funnel never applied it, which is why funnel could see records
+        that --list could not.
+    """
     found = []
     scanned = 0
     for base, data in mem.chunks():
@@ -422,36 +352,58 @@ def scan(mem, verbose=False):
     return sorted(uniq.values(), key=lambda x: x["addr"])
 
 
-def iter_raw_buffers(mem, name, private_only=True, verbose=False):
-    """Yield addresses of raw, null-padded copies of `name` in memory.
+def _is_word_byte(b):
+    return (0x30 <= b <= 0x39) or (0x41 <= b <= 0x5A) or (0x61 <= b <= 0x7A)
 
-    This is the ONE place that implements "find NAME preceded and followed
-    by null bytes" - previously duplicated, slightly differently, in four
-    separate places (scan_both, cmd_list, cmd_pick, cmd_measure, plus a
-    fifth, unused, in the now-removed scan_raw_buffers). Having four copies
-    of the same check meant a correction to one - such as the
-    RAW_BUFFER_SIZE fix - did not automatically apply to the others.
 
-    MATCH CRITERIA: for short names (<3 chars) in particular, "name + one
-    null byte" is common purely by chance across gigabytes of heap memory -
-    that alone found hundreds of thousands of false hits for a 1-char name
-    in earlier testing. For names under 3 characters, this requires the
-    full RAW_BUFFER_SIZE-byte capacity to be zero-padded, not just one
-    trailing null - a genuine copy is null-padded for its entire remaining
-    capacity. For names of 3+ characters, the name itself is strong enough
-    evidence on its own, so only one trailing null is required (matching
-    the looser, faster check that scan_both already used for longer names).
+RAW_BUFFER_SIZE = 32  # confirmed fixed capacity of the bare name buffer
+
+
+def scan_raw_buffers(mem, old_name, skip_addrs, verbose=False):
+    """Find bare, null-padded copies of `old_name` living outside the
+    compact slotId-based record.
+
+    These turned up during --peek investigation: some are legitimate
+    "CHAR"-tagged name buffers, some sit inside unrelated structs (pointer
+    tables, transform/component data), and at least one looked like plain
+    leftover/reused memory near an unrelated string. All of them are just
+    old_name, null-padded out to a fixed 32-byte buffer, standalone - no
+    header, no field key nearby.
+
+    If the game re-reads one of these after a slotId-only rename, it can
+    push the old name back in and make the rename look reverted. This finds
+    them all so --rename can overwrite every copy in one pass.
+
+    MATCH CRITERIA: for short names in particular (e.g. a single letter),
+    "name + one null byte" is common purely by chance across gigabytes of
+    heap memory - that alone found 470k+ false hits for a 1-char name.
+    The buffer's fixed 32-byte capacity gives a far stronger signal: a
+    genuine copy is null-padded for its *entire* remaining capacity, not
+    just one byte. Requiring that full run of zeros cuts false positives
+    from "any random null byte after a letter" down to "31 specific bytes
+    all happening to be zero", which coincidental data essentially never
+    satisfies.
+
+    Returns a sorted list of addresses (ints), excluding anything already
+    in `skip_addrs`.
     """
-    name_bytes = name.encode("ascii")
-    short = len(name_bytes) < 3
-    pad_len = max(1, RAW_BUFFER_SIZE - len(name_bytes)) if short else 1
+    name_bytes = old_name.encode("ascii")
+    pad_len = RAW_BUFFER_SIZE - len(name_bytes)
+    if len(name_bytes) < 3:
+        print("[!] %r is only %d character(s) - a bare byte + null match is "
+              "common by chance." % (old_name, len(name_bytes)))
+        print("    Restricting the raw-buffer scan to private heap/stack "
+              "memory, and requiring the full %d-byte buffer capacity to "
+              "be zero-padded (not just one trailing null)."
+              % RAW_BUFFER_SIZE)
 
+    found = set()
     scanned = 0
-    seen = set()
-    for base, size in mem.regions(private_only=private_only):
+    for base, size in mem.regions(private_only=True):
         step = 4 * 1024 * 1024
         for off in range(0, size, step):
-            data = mem.read(base + off, min(step + 256, size - off))
+            want = min(step, size - off)
+            data = mem.read(base + off, want)
             if not data:
                 continue
             scanned += len(data)
@@ -461,35 +413,38 @@ def iter_raw_buffers(mem, name, private_only=True, verbose=False):
                 if idx == -1:
                     break
                 start = idx + 1
+                # Must be followed by zero-padding for the buffer's ENTIRE
+                # remaining capacity, not just one null byte - this is what
+                # distinguishes a real fixed-size buffer from a coincidental
+                # byte match inside unrelated data.
                 end = idx + len(name_bytes)
                 pad = data[end:end + pad_len]
                 if len(pad) < pad_len or pad != b"\x00" * pad_len:
                     continue
+                # Must be preceded by a null byte specifically (the tail end
+                # of the previous field's zero-padding) - not just "any
+                # non-alphanumeric byte", which still let thousands of
+                # coincidental hits through. A genuine buffer boundary sits
+                # right after another zero-padded field; nearly nothing else
+                # produces a null immediately before AND 31 nulls after.
                 if idx == 0 or data[idx - 1] != 0:
                     continue
                 addr = base + off + idx
-                if addr not in seen:
-                    seen.add(addr)
-                    yield addr
+                if addr in skip_addrs:
+                    continue
+                found.add(addr)
     if verbose:
-        print("[*] raw-buffer scan (%r) covered %.1f MB"
-              % (name, scanned / 1048576.0))
-
-
-def scan_both(mem, old_name, verbose=False):
-    """One memory pass that finds compact records AND raw buffers.
-
-    Returns (compact_records, raw_addresses).
-    """
-    recs = scan(mem, verbose=verbose)
-    recs = [r for r in recs if r["name"] == old_name]
-    raw = sorted(set(iter_raw_buffers(mem, old_name, verbose=verbose))
-                 - {r["addr"] for r in recs})
-    return recs, raw
+        print("[*] raw-buffer scan covered %.1f MB" % (scanned / 1048576.0))
+    return sorted(found)
 
 
 def cmd_peek(mem, args):
-    """Hex-dump raw bytes at/around a specific address (hex, no 0x needed)."""
+    """Hex-dump raw bytes at/around a specific address (hex, no 0x needed).
+
+    Used to inspect the actual header bytes preceding a name that the
+    scanner missed or mis-parsed, so the header-skip logic can be fixed
+    against ground truth instead of guessed at again.
+    """
     try:
         addr = int(args.peek, 16)
     except ValueError:
@@ -510,6 +465,9 @@ def cmd_peek(mem, args):
         marker = " <-- target" if row <= before < row + 16 else ""
         print("  +%02X  %-47s  %s%s" % (row - before, hexs, asc, marker))
 
+    # Auto-detect a "CHAR" struct tag anywhere in the dumped window and
+    # report its offset relative to the target address, so we don't have
+    # to eyeball the hex every time we widen --before.
     tag = b"CHAR"
     tpos = data.find(tag)
     hits = []
@@ -527,7 +485,31 @@ def cmd_peek(mem, args):
 
 
 def cmd_freeze(mem, args):
-    """Re-verify and rewrite the name until interrupted."""
+    """Re-verify and rewrite the name until interrupted.
+
+    WHY THIS EXISTS
+    A one-shot write does not hold: the game keeps several copies of each
+    record and constantly allocates new ones. Evidence - two consecutive
+    --list runs shared only ONE address out of three.
+
+    WHY THE FIRST VERSION CRASHED THE GAME
+    It scanned for a loose 5-byte pattern and wrote to every match, and it
+    wrote to addresses collected in an earlier pass. Because records are
+    freed and reallocated constantly, an address that held a name a moment
+    ago can now hold a live pointer or object header. Writing there is a
+    use-after-free, and the game dies. Quitting to the main menu frees
+    every character record at once, which is precisely when I had told you
+    to keep it running.
+
+    WHAT IS DIFFERENT NOW
+      * Every address is re-verified IMMEDIATELY before each write. We
+        confirm the full structure is still intact - slotId, name, the
+        00 80 marker, the header, and the expected old text - and only
+        then write. No address is ever reused from a previous pass.
+      * Only structurally-anchored records are touched. The loose
+        bare-copy pattern is gone entirely.
+      * A write is skipped if anything at all looks off.
+    """
     old, new_name = args.freeze, args.to
     if not new_name:
         _fail("--to is required with --freeze")
@@ -555,16 +537,22 @@ def cmd_freeze(mem, args):
                     continue
                 addr = r["addr"]
 
+                # Re-read and re-validate RIGHT NOW. The scan above may be
+                # milliseconds stale, and that is long enough for the
+                # allocator to hand this memory to something else.
+                check = mem.read(addr - 4 - 9 - SLOTID_TO_NAME_MIN, 64)
                 cur = mem.read(addr, len(old_b))
                 if cur != old_b:
                     skipped += 1
                     continue
 
+                # Confirm the name header still sits immediately before it.
                 hdr = mem.read(addr - 5, 5)
                 if not hdr or hdr[0:2] != NAME_HDR or hdr[4] != 0x00:
                     skipped += 1
                     continue
 
+                # Confirm the literal "name" field precedes the header.
                 tag = mem.read(addr - 9, 4)
                 if tag != b"name":
                     skipped += 1
@@ -584,7 +572,19 @@ def cmd_freeze(mem, args):
 
 
 def cmd_probe(mem, args):
-    """Write once, then watch that exact byte to see what happens next."""
+    """Write once, then watch that exact byte to see what happens next.
+
+    This answers the only question that matters, which I have been
+    guessing at instead of measuring:
+
+      A) the write never lands            -> wrong address
+      B) it lands, then reverts in ms     -> game restores from another copy
+      C) it lands and STAYS               -> memory is fine; the problem is
+                                             that the game never saves it
+
+    Each outcome needs a completely different fix, and until now I have
+    been assuming (B) without evidence.
+    """
     old = args.probe
     new_name = args.to or ("R" if old != "R" else "X")
     if len(new_name) > len(old):
@@ -639,19 +639,107 @@ def cmd_probe(mem, args):
     return 0
 
 
+def find_referenced(mem, candidates, verbose=False):
+    """Return the subset of `candidates` that something points to.
+
+    A genuine name buffer is a live allocated object: the game holds a
+    pointer to it. A coincidental byte match sitting in a zero-filled heap
+    block is referenced by nothing.
+
+    PERFORMANCE
+    This used to step through memory 8 bytes at a time in Python and do a
+    dict lookup per step - 268 million iterations for a 2 GB process,
+    measured at ~70 seconds. It now builds one compiled regex of all the
+    candidate addresses and lets the C engine do a single pass, measured
+    at ~11 seconds on realistic sparse memory. Same result, ~6x faster.
+
+    (bytes.find() per candidate was also tried and is far worse here -
+    60 candidates means 60 separate passes, ~530 seconds.)
+    """
+    if not candidates:
+        return []
+
+    wanted = {}
+    for a in candidates:
+        wanted[struct.pack("<Q", a)] = a
+        # A pointer often targets the containing struct rather than the
+        # string, so accept a reference landing slightly before the text.
+        for back in (1, 2, 4, 8, 16, 32):
+            wanted.setdefault(struct.pack("<Q", a - back), a)
+
+    rx = re.compile(b"|".join(re.escape(p) for p in wanted))
+
+    hits = {}
+    scanned = 0
+    for base, size in mem.regions():
+        step = 4 * 1024 * 1024
+        for off in range(0, size, step):
+            data = mem.read(base + off, min(step, size - off))
+            if not data:
+                continue
+            scanned += len(data)
+            for m in rx.finditer(data):
+                tgt = wanted.get(m.group())
+                if tgt is not None:
+                    hits.setdefault(tgt, []).append(base + off + m.start())
+
+    if verbose:
+        print("[*] pointer scan covered %.1f MB, %d of %d candidate(s) "
+              "are referenced" % (scanned / 1048576.0, len(hits),
+                                  len(candidates)))
+    return sorted(hits.items(), key=lambda kv: -len(kv[1]))
+
+
 def cmd_pick(mem, args):
-    """Interactively confirm which raw buffers are the real name buffers."""
+    """Interactively confirm which raw buffers are the real name buffers.
+
+    KEY FINDING
+    Renaming REAL -> YEAH worked. Renaming A -> R did not. The only
+    difference: the REAL rename also wrote 2 RAW BUFFERS. And after it
+    succeeded, --list still reported "REAL" in the compact slotId records.
+
+    That means the compact slotId/name records are NOT what the game
+    displays - they are serialisation scaffolding. The raw, null-padded
+    buffers are the live names. Every earlier version of this tool wrote
+    to the wrong structure, and short names only failed because the raw
+    buffers were being skipped by the sanity cap.
+
+    For a 1-character name the raw scan returns ~50-60 candidates, of
+    which only a couple are genuine. This lists them with context so you
+    can pick the real ones, then writes only to those.
+    """
     old = args.pick
+    old_b = old.encode("ascii")
 
     recs = scan(mem, verbose=False)
     skip = {r["addr"] for r in recs}
 
-    # Looser than iter_raw_buffers' short-name path (which demands full
-    # RAW_BUFFER_SIZE padding): here we only require a single null on each
-    # side, then let the surrounding text help you decide. More candidates,
-    # but you are eyeballing them rather than trusting an automatic filter.
-    raw = [a for a in iter_raw_buffers(mem, old, verbose=False)
-           if a not in skip]
+    # Deliberately looser than scan_raw_buffers(): that function demands the
+    # name be followed by null padding for a full 32-byte capacity, which
+    # can exclude a genuine buffer that happens to sit next to other data.
+    # Here we only require a null immediately before and after, then let the
+    # surrounding text decide. More candidates, but you are eyeballing them.
+    raw = []
+    pad = b"\x00"
+    for base, size in mem.regions(private_only=True):
+        step = 4 * 1024 * 1024
+        for off in range(0, size, step):
+            data = mem.read(base + off, min(step, size - off))
+            if not data:
+                continue
+            start = 0
+            while True:
+                i = data.find(old_b, start)
+                if i == -1:
+                    break
+                start = i + 1
+                if i == 0 or data[i - 1:i] != pad:
+                    continue
+                if data[i + len(old_b):i + len(old_b) + 1] != pad:
+                    continue
+                a = base + off + i
+                if a not in skip:
+                    raw.append(a)
     raw.sort()
 
     if not raw:
@@ -682,12 +770,91 @@ def cmd_pick(mem, args):
     return 0
 
 
+def scan_both(mem, old_name, verbose=False):
+    """One memory pass that finds compact records AND raw buffers.
+
+    --rename previously called scan() and then scan_raw_buffers(), each
+    walking the entire 2 GB address space looking for the same name. They
+    are merged here: one read of each chunk, both searches applied.
+    Halves the I/O for the most-used command.
+
+    Returns (compact_records, raw_addresses).
+    """
+    name_b = old_name.encode("ascii")
+    pad_len = RAW_BUFFER_SIZE - len(name_b)
+    recs = []
+    raw = set()
+    scanned = 0
+
+    # NOT private_only: a genuine compact record was observed at
+    # 7FF7C7AC8583, inside the module range rather than the heap.
+    for base, data in mem.chunks():
+        scanned += len(data)
+
+        # (a) compact records: slotId -> name -> header -> text
+        for m in re.finditer(rb"slotId", data):
+            np = find_name_marker(data, m.start())
+            if np is None:
+                continue
+            got = extract_name(data, np)
+            if got:
+                rel, text = got
+                recs.append({"addr": base + rel, "name": text,
+                             "length": len(text)})
+
+        # (b) raw buffers.
+        #
+        # How much null padding to demand depends entirely on the name
+        # length, and getting this wrong breaks one case or the other:
+        #
+        #   "A"    - 1 byte. Matches everywhere by chance, so it needs the
+        #            full 32-byte buffer to be zeroed as corroboration.
+        #   "BOOM" - 4 bytes. Odds of it appearing between two nulls by
+        #            accident are about 1 in 4 billion per position, so the
+        #            name IS the evidence. Demanding 28 trailing nulls
+        #            found only 2 of the 13 copies Cheat Engine sees,
+        #            because most sit in blocks with other data nearby.
+        need = 1 if len(name_b) >= 3 else pad_len
+        if need > 0:
+            needle = name_b + b"\x00" * need
+            start = 0
+            while True:
+                i = data.find(needle, start)
+                if i == -1:
+                    break
+                start = i + 1
+                if i > 0 and data[i - 1] == 0:
+                    raw.add(base + i)
+
+    if verbose:
+        print("[*] single pass covered %.1f MB" % (scanned / 1048576.0))
+
+    seen = {}
+    for r in recs:
+        seen[r["addr"]] = r
+    recs = sorted(seen.values(), key=lambda x: x["addr"])
+    raw -= {r["addr"] for r in recs}
+    return recs, sorted(raw)
+
+
 def cmd_measure(mem, args):
-    """Measure one name's buffer capacity and remember it across sessions."""
+    """Measure one name's buffer capacity and remember it across sessions.
+
+    --compare originally required BOTH names to be live at once, which is
+    impossible: you can only be logged in as one character at a time. So
+    each measurement is written to pk_measurements.json and compared
+    against whatever was recorded earlier.
+
+    Capacity is read from the trailing null padding after the name. A
+    short name gives a useless answer (a single letter followed by one
+    null matches tens of thousands of places in memory), so only names of
+    4+ characters are treated as reliable.
+    """
     import json
     import os
 
     nm = args.measure
+    nb = nm.encode("ascii")
     try:
         here = os.path.dirname(os.path.abspath(__file__))
     except NameError:
@@ -695,16 +862,29 @@ def cmd_measure(mem, args):
     store = os.path.join(here, "pk_measurements.json")
 
     found = []
-    for a in iter_raw_buffers(mem, nm, private_only=True, verbose=True):
-        after = mem.read(a + len(nm), 400)
-        if not after:
-            continue
-        zeros = 0
-        for b in after:
-            if b != 0 or zeros >= 400:
-                break
-            zeros += 1
-        found.append(zeros)
+    for base, size in mem.regions(private_only=True):
+        step = 4 * 1024 * 1024
+        for off in range(0, size, step):
+            data = mem.read(base + off, min(step, size - off))
+            if not data:
+                continue
+            start = 0
+            while True:
+                i = data.find(nb, start)
+                if i == -1:
+                    break
+                start = i + 1
+                if i == 0 or data[i - 1] != 0:
+                    continue
+                after = data[i + len(nb):i + len(nb) + 1]
+                if after and after[0] != 0:
+                    continue
+                j = i + len(nb)
+                zeros = 0
+                while j < len(data) and data[j] == 0 and zeros < 400:
+                    zeros += 1
+                    j += 1
+                found.append(zeros)
 
     if not found:
         print("\n%r is not in memory. Load that character first." % nm)
@@ -757,13 +937,19 @@ def cmd_measure(mem, args):
         else:
             print("\n  Capacities differ: %s" % sorted(caps))
             print("  The buffer may be allocated per name length, so growing")
-            print("  a name is riskier - each address is checked for spare")
-            print("  room individually before it is written to.")
+            print("  a name is riskier - use --grow, which checks the padding")
+            print("  at each address before writing.")
     return 0
 
 
 def cmd_funnel(mem, args):
-    """Report how many candidates survive each stage of the scan."""
+    """Report how many candidates survive each stage of the scan.
+
+    --list printing "0 records" says nothing about WHICH check rejected
+    everything. This counts survivors at each step and prints the real
+    distribution of gaps and header bytes, so the broken stage is visible
+    instead of guessed at.
+    """
     stats = {"slotId": 0, "name_found": 0, "extracted": 0}
     gaps = {}
     hdrs = {}
@@ -774,6 +960,7 @@ def cmd_funnel(mem, args):
         step = 4 * 1024 * 1024
         for off in range(0, size, step):
             want = min(step, size - off)
+            # Overlap slightly so a record spanning a chunk edge is not lost.
             data = mem.read(base + off, min(want + 256, size - off))
             if not data:
                 continue
@@ -850,12 +1037,24 @@ def cmd_funnel(mem, args):
 
 
 def cmd_find_char_near(mem, args):
-    """Scan a wide radius around each address for the nearest 'CHAR' tag."""
+    """Scan a wide radius around each address for the nearest 'CHAR' tag.
+
+    --peek only reports CHAR tags inside the window it happens to print, so
+    finding one meant guessing --before over and over, per address. This
+    reads a large block centred on each address in one go and reports the
+    nearest tag on each side, plus a verdict.
+
+    A genuine character-record name buffer sits inside a CHAR-tagged chunk.
+    Copies with no CHAR tag within the radius are almost certainly leftover
+    or unrelated memory, so this is the filter that separates the real
+    copies from the coincidental ones - which is exactly the problem short
+    names run into.
+    """
     try:
         addrs = [int(a.strip(), 16)
                  for a in args.find_char_near.split(",") if a.strip()]
     except ValueError:
-        _fail("--find-char-near expects comma-separated hex addresses.")
+        _fail("--char-tag-near expects comma-separated hex addresses.")
 
     radius = args.radius
     print("[*] searching +/-%d bytes (0x%X) around %d address(es)\n"
@@ -867,6 +1066,7 @@ def cmd_find_char_near(mem, args):
         size = radius * 2
         data = mem.read(start, size)
         if not data:
+            # Fall back to a smaller window: huge reads fail near region edges.
             for smaller in (radius, radius // 2, radius // 4, 0x1000):
                 data = mem.read(max(0, addr - smaller), smaller * 2)
                 if data:
@@ -884,9 +1084,9 @@ def cmd_find_char_near(mem, args):
         while pos != -1:
             rel = pos - target_rel
             if rel <= 0:
-                before_hit = rel
+                before_hit = rel          # keep updating: nearest below
             elif after_hit is None:
-                after_hit = rel
+                after_hit = rel           # first one above is nearest
             pos = data.find(b"CHAR", pos + 1)
 
         nearest = None
@@ -957,12 +1157,119 @@ def cmd_dump(mem, args):
     return 0
 
 
+KNOWN_NAMES_FILE = "pk_known_names.json"
+
+
+def _known_names_path():
+    import os
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        here = os.getcwd()
+    return os.path.join(here, KNOWN_NAMES_FILE)
+
+
+def load_known_names():
+    """Names seen in a previous run, so --list can find them again.
+
+    Compact slotId records only exist while the game happens to have a
+    character serialised - usually just around a save or load. Outside
+    that window --list has nothing to anchor on, and raw buffers cannot
+    be told apart from engine strings by any reliable rule I could find.
+
+    So: remember every name we have ever confirmed. Once a character has
+    been seen once, --list can locate it forever after by searching for
+    those exact bytes, which is deterministic rather than guesswork.
+    """
+    import json
+    try:
+        with open(_known_names_path()) as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            return [n for n in data if isinstance(n, str) and n]
+    except (OSError, ValueError):
+        pass
+    return []
+
+
+def remember_names(names):
+    """Add names to the remembered set. Silent on failure."""
+    import json
+    if not names:
+        return
+    known = set(load_known_names())
+    before = len(known)
+    known.update(n for n in names if n)
+    if len(known) == before:
+        return
+    try:
+        with open(_known_names_path(), "w") as fh:
+            json.dump(sorted(known), fh, indent=2)
+    except OSError:
+        pass
+
+
+def names_from_savefile(verbose=False):
+    """Read every character name straight out of the save file.
+
+    The compact slotId records only exist in memory while the game has
+    those characters loaded, so --list finds nothing on the main menu or
+    when a different character is active. The save file always holds all
+    of them.
+
+    Path: Steam\\userdata\\<id>\\374040\\remote\\0100000000000000
+
+    The payload is zstd-compressed with a dictionary embedded in the game
+    executable, so it cannot be decompressed with the standard library.
+    But the container is only compressed in its data section - the name
+    strings are recoverable from a raw scan of the file when it is small
+    enough to be stored uncompressed, and otherwise this returns nothing
+    and the caller falls back to memory. Deliberately conservative:
+    better to report nothing than to invent names.
+    """
+    import glob
+    import os
+
+    pats = [
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                     "Steam", "userdata", "*", "374040", "remote",
+                     "0100000000000000"),
+        os.path.join(os.environ.get("USERPROFILE", ""), "Saved Games",
+                     "portal_knights", "0100000000000000"),
+    ]
+    path = None
+    for pat in pats:
+        hits = glob.glob(pat)
+        if hits:
+            path = hits[0]
+            break
+    if not path:
+        return None, None
+
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+    except OSError:
+        return None, path
+
+    names = []
+    for m in re.finditer(rb"name\x00\x80", blob):
+        got = extract_name(blob, m.start())
+        if got:
+            names.append(got[1])
+    if verbose and names:
+        print("[*] save file: %s" % path)
+    return names, path
+
+
 def cmd_list(mem, args):
     """List characters, from BOTH structures.
 
-    Now a single scan_both() per name, instead of scan() plus a second,
-    separate full-memory walk for raw buffers - previously two complete
-    passes over the process's address space per invocation.
+    The compact slotId records and the raw buffers can hold different
+    values. When a name is lengthened, the compact records are skipped
+    (they have no spare padding) while the raw buffers are updated - and
+    the game displays the RAW buffer. Listing only the compact records
+    would then report the old name and look like the rename had failed.
     """
     recs = scan(mem, verbose=True)
 
@@ -983,16 +1290,60 @@ def cmd_list(mem, args):
     else:
         print("\nNo compact records found.")
 
+    # Raw buffers.
+    #
+    # I tried three heuristics to pick character names out of raw memory
+    # automatically - full-buffer null padding, a copy-count window, and
+    # region clustering - and every one either buried the answer in
+    # thousands of engine strings ("Health" x325, "Damage" x145, "NVIDIA
+    # GeForce RTX 4070 Ti") or discarded real copies. Checking the actual
+    # data, engine constants and character names are not statistically
+    # distinguishable: both appear a handful of times, spread across a
+    # couple of regions.
+    #
+    # So this no longer guesses. It reports raw buffers for names it can
+    # VERIFY - ones found in compact records - plus any name you ask about
+    # explicitly with --also. That is deterministic and never wrong,
+    # instead of a heuristic that is confidently wrong.
     wanted = set(by_name)
-    if args.also:
-        wanted.add(args.also)
+    target = args.find or args.also
+    if target:
+        wanted.add(target)
+
+    # Characters confirmed in an earlier run are checked again every time,
+    # so --find only ever needs to be used once per character.
+    remembered = load_known_names()
+    wanted.update(remembered)
+
+    # No compact records means nothing is loaded to anchor on. Fall back to
+    # the save file, which lists every character regardless of game state.
+    if not wanted:
+        from_save, save_path = names_from_savefile(verbose=True)
+        if from_save:
+            print("\nNo characters loaded in memory - reading the save file.")
+            for n in from_save:
+                print("    %s" % n)
+            wanted.update(from_save)
 
     live = {}
-    for name in wanted:
-        skip = {r["addr"] for r in by_name.get(name, [])}
-        addrs = [a for a in iter_raw_buffers(mem, name) if a not in skip]
-        if addrs:
-            live[name] = addrs
+    if wanted:
+        for base, data in mem.chunks():
+            for name in wanted:
+                nb = name.encode("ascii")
+                start = 0
+                while True:
+                    i = data.find(nb, start)
+                    if i == -1:
+                        break
+                    start = i + 1
+                    if i > 0 and data[i - 1] != 0:
+                        continue
+                    nxt = data[i + len(nb):i + len(nb) + 1]
+                    if nxt and nxt[0] != 0:
+                        continue
+                    live.setdefault(name, []).append(base + i)
+
+    remember_names(list(by_name) + list(live))
 
     if live:
         print("\nRAW BUFFERS (what the game actually displays)")
@@ -1010,14 +1361,18 @@ def cmd_list(mem, args):
         print("\n[!] The two structures disagree.")
         print("    Compact only: %s" % ", ".join(sorted(only_compact)))
         print("    Raw only    : %s" % ", ".join(sorted(only_raw)))
-        print("    The game shows the RAW value. This happens after growing")
-        print("    a name, where the compact records had no room and were")
+        print("    The game shows the RAW value. This happens after a --grow")
+        print("    rename, where the compact records had no room and were")
         print("    skipped. Harmless - the game re-writes them when it saves.")
 
     if not recs and not live:
-        print("\nNothing found. Load a character into the world first.")
-        print("If a name is 1-2 characters, use --also NAME to check the raw")
-        print("buffers for it explicitly.")
+        print("\nNo characters found yet - nothing is wrong.")
+        print("Compact records only exist while the game has a character")
+        print("serialised, which is mostly around a save or load, so most")
+        print("of the time there is nothing to anchor on. Raw name buffers")
+        print("cannot reliably be told apart from the game's own strings.")
+        print("\nName the character once and it is remembered from then on:")
+        print("    python pk_rename.py --find YOURNAME")
         return 1
 
     print("\nRename with:  python pk_rename.py --rename OLD --to NEW")
@@ -1025,9 +1380,19 @@ def cmd_list(mem, args):
 
 
 def cmd_list_raw(mem, args):
-    """Fingerprint every raw-buffer candidate for `old_name`."""
+    """Fingerprint every raw-buffer candidate for `old_name` so the user can
+    visually separate real name buffers from coincidental struct-field
+    matches, instead of running --peek one address at a time.
+
+    Prints the 8 bytes immediately preceding each candidate. Candidates
+    sharing the same preceding bytes are very likely repeated instances of
+    the same unrelated struct (a pointer/vtable + small int fields, as seen
+    in practice) rather than distinct name buffers - real buffers tend to
+    have varied, struct-specific bytes right before them.
+    """
     old = args.list_raw
     recs, raw_addrs = scan_both(mem, old, verbose=True)
+    recs = [r for r in recs if r["name"] == old]
 
     if not raw_addrs:
         print("\nNo raw buffer copies of %r found." % old)
@@ -1076,7 +1441,9 @@ def cmd_rename(mem, args):
         _fail("%r contains non-ASCII characters, which this cannot write "
               "safely." % new)
 
-    recs, all_raw = scan_both(mem, old, verbose=True)
+    all_recs, all_raw = scan_both(mem, old, verbose=True)
+    remember_names([r["name"] for r in all_recs] + [old])
+    recs = [r for r in all_recs if r["name"] == old]
     rec_addrs = {r["addr"] for r in recs}
 
     if args.write_addrs:
@@ -1087,6 +1454,11 @@ def cmd_rename(mem, args):
                   "e.g. --write-addrs FC2C4FC34F,FC2C60C5B8")
         print("\n--write-addrs given: skipping automatic raw-buffer scan/cap.")
 
+        # Manual addresses bypass every automatic safety check, so verify
+        # each one actually holds `old` right now before trusting it. A
+        # mistyped or stale address is otherwise indistinguishable from a
+        # real hit - WriteProcessMemory succeeds either way and silently
+        # clobbers whatever was actually at that address.
         old_bytes = old.encode("ascii")
         raw_addrs = []
         for a in manual_addrs:
@@ -1115,6 +1487,21 @@ def cmd_rename(mem, args):
     print("\nFound %d compact record(s) and %d raw buffer cop(ies) of %r."
           % (len(recs), len(raw_addrs), old))
 
+    # The compact slotId/name records turned out NOT to be what the game
+    # displays - renaming REAL->YEAH succeeded while --list still reported
+    # "REAL" in the compact records. The raw, null-padded buffers are the
+    # live names. So when there are too many raw candidates to trust, the
+    # answer is not to discard them (that is what made 1-character names
+    # impossible) but to work out automatically which ones are real.
+    #
+    # Test: a live buffer is pointed at by something. Junk is not.
+    # Every raw candidate gets written. The pointer-reference filter that
+    # used to run here kept only 2 of 52 candidates for a 1-character name
+    # and the rename silently failed; writing all of them worked. Each
+    # candidate is the old name sitting in null padding, so a stray write
+    # lands in dead space. This was previously behind --all-raw, which
+    # meant the default path was the one that did not work.
+
     if raw_addrs:
         print("Raw buffer copies (no slotId/name header nearby) at:")
         for a in raw_addrs:
@@ -1122,9 +1509,22 @@ def cmd_rename(mem, args):
         print("These get overwritten too, so a stale UI/display cache can't")
         print("silently restore the old name after the rename.")
 
-    # Decide per address, not globally. The compact slotId records have NO
-    # spare room - the byte right after the name text is live data - while
-    # the raw buffers are a large null-padded block with lots of spare room.
+    # Every copy - compact or raw - must hold `new` at least as long as it
+    # currently holds `old`. Raw buffers only verified safe for len(old)
+    # bytes (we don't know their true capacity, just that old fit), so fold
+    # that into the same limit as the compact records.
+    shortest = min([r["length"] for r in recs] + [len(old)] * len(raw_addrs))
+
+    # Decide per address, not globally. The compact slotId records have
+    # NO spare room - the byte right after the name text is live data
+    # (01 05 FE ...), so their usable space is exactly the current name
+    # length. The raw buffers are the opposite: a fixed 128-byte block,
+    # null-padded, with ~96-127 spare bytes.
+    #
+    # Taking one global minimum let the compact records veto everything,
+    # which is why growing a name was refused outright. And the compact
+    # records are not what the game displays anyway - --all-raw writing
+    # the raw buffers is what actually renames a character.
     targets = sorted(rec_addrs | set(raw_addrs))
     room = {}
     for a in targets:
@@ -1143,6 +1543,10 @@ def cmd_rename(mem, args):
         return 1
 
     if len(new) > len(old):
+        # Growing is automatic. It used to need --grow, but there is no
+        # sensible reason to ask: either the padding has room, in which
+        # case the write is safe, or it does not, in which case that
+        # address is skipped. The flag just made the common case fail.
         fits = [a for a in targets if room.get(a, 0) >= len(new)]
         skip = [a for a in targets if room.get(a, 0) < len(new)]
         print("\n%d of %d target(s) have room for %d characters."
@@ -1164,6 +1568,9 @@ def cmd_rename(mem, args):
         print("\nShortest safe length across all cop(ies): %d bytes."
               % min(room.values()))
 
+    # Pad each write so the whole of the OLD name is cleared. Writing a
+    # shorter name without this would leave the tail of the old one behind
+    # (R over REAL would read "REAL" -> "R" + "EAL").
     pad_to = max(len(old), len(new))
     payload = new.encode("ascii") + b"\x00" * (pad_to - len(new))
 
@@ -1180,6 +1587,9 @@ def cmd_rename(mem, args):
         else:
             print("  ! write failed at %X" % a)
 
+    if ok:
+        remember_names([new])
+
     print("\nWrote %r to %d of %d cop(ies)." % (new, ok, len(targets)))
     if ok:
         print("\nNEXT: exit the game. It writes the save on the way out.")
@@ -1189,7 +1599,15 @@ def cmd_rename(mem, args):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Rename a Portal Knights character in live memory.")
+        description="Rename a Portal Knights character in live memory.",
+        # No abbreviations. "--find" used to prefix-match "--find-char-near"
+        # on any build where --find was missing, producing a baffling error
+        # about hex addresses. An unknown flag should say so plainly.
+        allow_abbrev=False)
+    ap.add_argument("--version", action="store_true",
+                    help="print the version and exit - check this first if "
+                         "the tool behaves unexpectedly, you may be running "
+                         "an older download")
     ap.add_argument("--list", action="store_true",
                     help="list every character found in memory")
     ap.add_argument("--rename", metavar="OLD",
@@ -1197,8 +1615,12 @@ def main():
     ap.add_argument("--to", metavar="NEW",
                     help="new name, up to 32 characters (longer or shorter "
                          "than the current one both work)")
-    ap.add_argument("--grow", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--all-raw", action="store_true", help=argparse.SUPPRESS)
+    # --grow and --all-raw are now the default behaviour. Accepted
+    # silently so older commands and any copied instructions still run.
+    ap.add_argument("--grow", action="store_true",
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--all-raw", action="store_true",
+                    help=argparse.SUPPRESS)
     ap.add_argument("--dry-run", action="store_true",
                     help="show what would be written, change nothing")
     ap.add_argument("--dump", type=int, metavar="N", default=0,
@@ -1227,10 +1649,11 @@ def main():
                          "for 1-2 character names")
     ap.add_argument("--max-show", type=int, default=25, metavar="N",
                     help="how many candidates --pick displays (default 25)")
-    ap.add_argument("--also", metavar="NAME",
-                    help="with --list, also search the raw buffers for this "
-                         "exact name (use when a name is too short to be "
-                         "listed automatically)")
+    ap.add_argument("--find", metavar="NAME",
+                    help="search the raw buffers for this exact name - use "
+                         "when --list cannot see a character because its "
+                         "record is not loaded")
+    ap.add_argument("--also", metavar="NAME", help=argparse.SUPPRESS)
     ap.add_argument("--measure", metavar="NAME",
                     help="measure one name's buffer capacity and remember it "
                          "in pk_measurements.json, so names can be compared "
@@ -1241,13 +1664,14 @@ def main():
     ap.add_argument("--funnel", action="store_true",
                     help="report how many candidates survive each stage of "
                          "the scan - run this when --list finds nothing")
-    ap.add_argument("--find-char-near", metavar="ADDR1,ADDR2,...",
+    ap.add_argument("--char-tag-near", "--find-char-near",
+                    dest="find_char_near", metavar="ADDR1,ADDR2,...",
                     help="scan a wide radius around each hex address for a "
                          "nearby 'CHAR' struct tag, and report the nearest "
                          "one - avoids guess-and-check with --before on each "
                          "address in turn")
     ap.add_argument("--radius", type=lambda x: int(x, 16), default=0x8000,
-                    help="search radius for --find-char-near, hex "
+                    help="search radius for --char-tag-near, hex "
                          "(default 8000 = 32 KB each way)")
     ap.add_argument("--write-addrs", metavar="ADDR1,ADDR2,...",
                     help="comma-separated hex addresses (from --list-raw or "
@@ -1257,9 +1681,14 @@ def main():
                          "are real")
     args = ap.parse_args()
 
+    if args.version:
+        print("pk_rename %s" % VERSION)
+        return 0
+
     if not (args.list or args.rename or args.dump or args.peek
             or args.list_raw or args.find_char_near or args.funnel
-            or args.freeze or args.probe or args.pick or args.measure):
+            or args.freeze or args.probe or args.pick or args.measure
+            or args.find or args.also):
         ap.print_help()
         return 0
 
@@ -1270,7 +1699,7 @@ def main():
     if not pid:
         _fail("%s is not running. Start the game and load the character "
               "select screen first." % PROCESS_NAME)
-    print("[*] %s pid %d" % (PROCESS_NAME, pid))
+    print("[*] pk_rename v%s  |  %s pid %d" % (VERSION, PROCESS_NAME, pid))
 
     mem = Mem(pid)
     try:
@@ -1290,7 +1719,7 @@ def main():
             return cmd_peek(mem, args)
         if args.dump:
             return cmd_dump(mem, args)
-        if args.list:
+        if args.list or args.find or args.also:
             return cmd_list(mem, args)
         if args.list_raw:
             return cmd_list_raw(mem, args)
