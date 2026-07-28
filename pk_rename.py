@@ -40,7 +40,7 @@ import re
 import struct
 import sys
 
-VERSION = "1.7"
+VERSION = "1.8"
 PROCESS_NAME = "portal_knights_x64.exe"
 
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -168,6 +168,7 @@ class Mem:
     """Minimal read/write/scan over another process's memory."""
 
     def __init__(self, pid):
+        self.pid = pid
         self.k32 = ctypes.windll.kernel32
         self.h = self.k32.OpenProcess(ACCESS, False, pid)
         if not self.h:
@@ -178,6 +179,72 @@ class Mem:
         if self.h:
             self.k32.CloseHandle(self.h)
             self.h = None
+
+    def module_range(self):
+        """(base, end) of portal_knights_x64.exe itself, or None.
+
+        Needed to tell the game's own module apart from loaded system
+        DLLs. A compact record genuinely lives in the game's module, but
+        nothing of ours ever lives in ntdll or a GPU driver.
+        """
+        cached = getattr(self, "_mod_range", "unset")
+        if cached != "unset":
+            return cached
+
+        TH32CS_SNAPMODULE = 0x00000008
+        TH32CS_SNAPMODULE32 = 0x00000010
+
+        class MODULEENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wt.DWORD),
+                ("th32ModuleID", wt.DWORD),
+                ("th32ProcessID", wt.DWORD),
+                ("GlblcntUsage", wt.DWORD),
+                ("ProccntUsage", wt.DWORD),
+                ("modBaseAddr", ctypes.POINTER(ctypes.c_byte)),
+                ("modBaseSize", wt.DWORD),
+                ("hModule", wt.HMODULE),
+                ("szModule", ctypes.c_char * 256),
+                ("szExePath", ctypes.c_char * 260),
+            ]
+
+        result = None
+        snap = self.k32.CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, self.pid)
+        if snap != -1:
+            me = MODULEENTRY32()
+            me.dwSize = ctypes.sizeof(MODULEENTRY32)
+            try:
+                if self.k32.Module32First(snap, ctypes.byref(me)):
+                    while True:
+                        nm = me.szModule.decode("ascii", "ignore").lower()
+                        if nm == PROCESS_NAME.lower():
+                            base = ctypes.cast(me.modBaseAddr,
+                                               ctypes.c_void_p).value or 0
+                            result = (base, base + int(me.modBaseSize))
+                            break
+                        if not self.k32.Module32Next(snap, ctypes.byref(me)):
+                            break
+            finally:
+                self.k32.CloseHandle(snap)
+        self._mod_range = result
+        return result
+
+    def writable_for_us(self, addr):
+        """True if `addr` is somewhere this tool may safely write.
+
+        Private heap/stack is fine. The game's own module is fine - real
+        records have been observed there. Everything else - ntdll,
+        kernel32, GPU drivers, mapped files - is emphatically not, and
+        writing there corrupts shared system state and crashes the game.
+        """
+        for base, size in self.regions(private_only=True):
+            if base <= addr < base + size:
+                return True
+        mod = self.module_range()
+        if mod and mod[0] <= addr < mod[1]:
+            return True
+        return False
 
     def chunks(self, private_only=False, step=4 * 1024 * 1024, overlap=256):
         """Yield (base_addr, data) covering all scannable memory once.
@@ -1593,6 +1660,40 @@ def cmd_rename(mem, args):
     else:
         print("\nShortest safe length across all cop(ies): %d bytes."
               % min(room.values()))
+
+    # HARD SAFETY GATE.
+    #
+    # A rename of "A" to a 17-character name wrote to 81 addresses, four
+    # of which were in the 7FFB... range - that is loaded system DLL
+    # memory (ntdll, kernel32, GPU drivers), not the game. Writing 17
+    # bytes there corrupted shared state and the game died with
+    # EXCEPTION_ACCESS_VIOLATION reading 0xFFFFFFFFFFFFFFFF, i.e. a
+    # pointer that had been overwritten with garbage.
+    #
+    # The cause was mine: the raw-buffer scan searched ALL writable
+    # memory. That was a deliberate change, made because a real compact
+    # record turned up in the game's own module - but it also opened up
+    # every system DLL as a write target. Reading them is harmless;
+    # writing to them is not.
+    #
+    # So: reads stay broad, writes are confined to the game's own private
+    # heap plus its own module. Nothing else is ever written.
+    safe, unsafe = [], []
+    for a in targets:
+        (safe if mem.writable_for_us(a) else unsafe).append(a)
+    if unsafe:
+        print("\n[!] Refusing %d address(es) outside the game's own memory:"
+              % len(unsafe))
+        for a in unsafe[:8]:
+            print("      %X" % a)
+        if len(unsafe) > 8:
+            print("      ... and %d more" % (len(unsafe) - 8))
+        print("    These are loaded system DLLs or mapped files. Writing")
+        print("    there crashes the game and corrupts shared state.")
+    targets = safe
+    if not targets:
+        print("\nNothing safe left to write.")
+        return 1
 
     # Pad each write so the whole of the OLD name is cleared. Writing a
     # shorter name without this would leave the tail of the old one behind
